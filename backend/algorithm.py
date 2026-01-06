@@ -1,87 +1,152 @@
-def get_bounding_box(points):
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return {
-        "width": max(xs) - min(xs),
-        "height": max(ys) - min(ys)
-    }
+from copy import deepcopy
 
 
-def translate_points(points, dx, dy):
-    return [[x + dx, y + dy] for x, y in points]
-
-
-def optimize_cut(sheet, parts):
+def best_subset(cuts, stock_length, kerf):
     """
-    Guillotine + Best Fit для деталей,
-    заданных координатами вершин.
+    Подбор набора отрезков с максимальной суммой <= stock_length
+    с учётом толщины лезвия (kerf)
     """
 
-    placements = []
+    best_sum = 0
+    best_combo = []
 
-    free_rects = [{
-        "x": 0,
-        "y": 0,
-        "width": sheet["width"],
-        "height": sheet["height"]
-    }]
+    cuts = sorted(cuts, key=lambda x: -x["length"])
 
-    total_area = sheet["width"] * sheet["height"]
-    used_area = 0
+    def backtrack(index, current_sum, combo):
+        nonlocal best_sum, best_combo
 
-    for part in parts:
-        bbox = get_bounding_box(part["points"])
-        pw, ph = bbox["width"], bbox["height"]
+        effective_sum = current_sum + kerf * len(combo)
+        if effective_sum > stock_length:
+            return
 
-        best_fit = None
+        if effective_sum > best_sum:
+            best_sum = effective_sum
+            best_combo = combo[:]
 
-        for rect in free_rects:
-            if pw <= rect["width"] and ph <= rect["height"]:
-                leftover = (rect["width"] - pw) * (rect["height"] - ph)
-                if best_fit is None or leftover < best_fit["leftover"]:
-                    best_fit = {"rect": rect, "leftover": leftover}
+        if index >= len(cuts):
+            return
 
-        if best_fit is None:
-            continue
+        remaining_max = current_sum + sum(c["length"] for c in cuts[index:])
+        if remaining_max + kerf * len(combo) <= best_sum:
+            return
 
-        r = best_fit["rect"]
-
-        placed_points = translate_points(
-            part["points"],
-            r["x"],
-            r["y"]
+        # взять текущий
+        backtrack(
+            index + 1,
+            current_sum + cuts[index]["length"],
+            combo + [cuts[index]]
         )
 
-        placements.append({
-            "original_points": part["points"],
-            "placed_points": placed_points,
-            "x": r["x"],
-            "y": r["y"]
-        })
+        # не брать
+        backtrack(index + 1, current_sum, combo)
 
-        used_area += pw * ph
+    backtrack(0, 0, [])
+    return best_combo
 
-        free_rects.remove(r)
 
-        if r["width"] - pw > 0:
-            free_rects.append({
-                "x": r["x"] + pw,
-                "y": r["y"],
-                "width": r["width"] - pw,
-                "height": ph
-            })
+def optimize_cut(stocks: list, cuts: list, settings: dict | None = None):
+    """
+    SmartCut-подобный линейный раскрой
+    Поддержка:
+    - толщина лезвия (kerf)
+    - торцовка (trimming)
+    """
 
-        if r["height"] - ph > 0:
-            free_rects.append({
-                "x": r["x"],
-                "y": r["y"] + ph,
-                "width": r["width"],
-                "height": r["height"] - ph
-            })
+    settings = settings or {}
+    kerf = settings.get("kerf", 0)
+    trimming = settings.get("trimming", 0)
 
-    waste = round((1 - used_area / total_area) * 100, 2)
+    materials = set(s["material"] for s in stocks) | set(c["material"] for c in cuts)
 
-    return {
-        "placements": placements,
-        "waste": waste
+    result = {
+        "materials": {},
+        "total_waste_percent": 0
     }
+
+    total_stock_length = 0
+    total_waste_length = 0
+
+    for material in materials:
+        material_stocks = [s for s in stocks if s["material"] == material]
+        material_cuts = [c for c in cuts if c["material"] == material]
+
+        # --- заготовки ---
+        expanded_stocks = []
+        for s in material_stocks:
+            for _ in range(s.get("quantity", 1)):
+                effective_length = max(0, s["length"] - trimming)
+                expanded_stocks.append({
+                    "length": effective_length,
+                    "original_length": s["length"],
+                    "remaining": effective_length,
+                    "name": s["name"],
+                    "priority": s.get("priority", 0),
+                    "cuts": []
+                })
+
+        expanded_stocks.sort(key=lambda x: (x["priority"], -x["length"]))
+
+        # --- отрезки ---
+        expanded_cuts = []
+        for c in material_cuts:
+            for _ in range(c.get("quantity", 1)):
+                expanded_cuts.append({
+                    "length": c["length"],
+                    "name": c["name"]
+                })
+
+        remaining_cuts = expanded_cuts[:]
+
+        # --- основной алгоритм ---
+        for stock in expanded_stocks:
+            if not remaining_cuts:
+                break
+
+            combo = best_subset(remaining_cuts, stock["length"], kerf)
+            if not combo:
+                continue
+
+            total_cut_len = sum(c["length"] for c in combo)
+            kerf_loss = kerf * len(combo)
+
+            stock["cuts"] = combo
+            stock["remaining"] = stock["length"] - total_cut_len - kerf_loss
+
+            for c in combo:
+                remaining_cuts.remove(c)
+
+        used_stocks = [s for s in expanded_stocks if s["cuts"]]
+        unused_stocks = [
+            {"length": s["original_length"], "name": s["name"]}
+            for s in expanded_stocks if not s["cuts"]
+        ]
+
+        material_stock_length = sum(s["original_length"] for s in used_stocks)
+        material_waste_length = sum(s["remaining"] for s in used_stocks)
+
+        waste_percent = (
+            round(material_waste_length / material_stock_length * 100, 2)
+            if material_stock_length > 0 else 0
+        )
+
+        total_stock_length += material_stock_length
+        total_waste_length += material_waste_length
+
+        result["materials"][material] = {
+            "used_stocks": len(used_stocks),
+            "used_cuts": sum(len(s["cuts"]) for s in used_stocks),
+            "waste_percent": waste_percent,
+            "stocks": used_stocks,
+            "unused_cuts": remaining_cuts,
+            "unused_stocks": unused_stocks
+        }
+
+    result["total_waste_percent"] = (
+        round(total_waste_length / total_stock_length * 100, 2)
+        if total_stock_length > 0 else 0
+    )
+
+    return result
+
+
+
